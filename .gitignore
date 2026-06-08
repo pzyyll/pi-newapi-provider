@@ -1,4 +1,30 @@
+# Dependencies
 node_modules/
+
+# Env
 .env
+.env.local
+.env.*.local
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Build (if emitting later)
+dist/
+build/
+
+# Coverage
+coverage/
+
+# ESLint cache
+.eslintcache
