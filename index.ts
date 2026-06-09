@@ -1,5 +1,6 @@
 import { exec } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { AuthStorage, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -75,6 +76,63 @@ interface ModelsJsonProviderConfig {
 	authHeader?: boolean;
 }
 
+type CacheRefreshMode = "background" | "blocking" | "off";
+type CacheState = "fresh" | "stale";
+
+interface CacheLoadResult<T> {
+	value?: T;
+	shouldRefresh: boolean;
+}
+
+interface CacheReadResult<T> {
+	value: T;
+	state: CacheState;
+}
+
+interface CachePayload<T> {
+	version: number;
+	key: string;
+	updatedAt: number;
+	value: T;
+}
+
+interface CachedValueOptions<T> {
+	namespace: string;
+	key: string;
+	ttlMs: number;
+	readValue: (value: unknown) => T | undefined;
+	fetchValue: () => Promise<T | undefined>;
+}
+
+interface CachedPublicModelMetadata {
+	lookupId: string;
+	metadata: PublicModelMetadata;
+}
+
+type PublicModelMetadataCacheValue = CachedPublicModelMetadata[];
+
+interface PublicModelMetadataLoadResult {
+	metadata: Map<string, PublicModelMetadata>;
+	shouldRefresh: boolean;
+}
+
+interface DiscoveredModelIdsLoadResult {
+	ids: string[];
+	shouldRefresh: boolean;
+}
+
+interface ProviderModelLoadResult {
+	models: NewApiModelConfig[];
+	publicModelMetadata: Map<string, PublicModelMetadata>;
+	discoveredModelIds: string[];
+	shouldRefresh: boolean;
+}
+
+interface NewApiDiscoverySource {
+	cacheKey: string;
+	headers: Record<string, string>;
+}
+
 const NEWAPI_WRAPPER_API = "newapi-gateway" as const;
 const PROVIDER_ID = process.env.NEWAPI_PROVIDER_ID?.trim() || "newapi";
 const MODELS_JSON_PROVIDER_CONFIG = readModelsJsonProviderConfig(PROVIDER_ID);
@@ -84,6 +142,15 @@ const BASE_URL = normalizeGatewayBaseUrl(
 );
 const MODELS_DEV_URL = process.env.NEWAPI_MODELS_DEV_URL?.trim() || "https://models.dev/models.json";
 const PROVIDER_API_KEY = MODELS_JSON_PROVIDER_CONFIG?.apiKey ?? "$NEWAPI_API_KEY";
+const MODEL_CACHE_VERSION = 1;
+const MODEL_CACHE_ENABLED = parseBoolean(process.env.NEWAPI_MODEL_CACHE, true);
+const MODEL_CACHE_DIR = join(getAgentDir(), "cache", "newapi-provider");
+const MODELS_CACHE_TTL_MS = parseDurationSeconds(process.env.NEWAPI_MODELS_CACHE_TTL, 30 * 60) * 1000;
+const MODEL_METADATA_CACHE_TTL_MS =
+	parseDurationSeconds(process.env.NEWAPI_MODEL_METADATA_CACHE_TTL, 24 * 60 * 60) * 1000;
+const MODEL_CACHE_STALE_TTL_MS =
+	parseDurationSeconds(process.env.NEWAPI_MODEL_CACHE_STALE_TTL, 7 * 24 * 60 * 60) * 1000;
+const MODEL_CACHE_REFRESH_MODE = parseCacheRefreshMode(process.env.NEWAPI_MODEL_CACHE_REFRESH);
 
 const DEFAULT_CONTEXT_WINDOW = parsePositiveInteger(process.env.NEWAPI_CONTEXT_WINDOW, 128_000);
 const DEFAULT_MAX_TOKENS = parsePositiveInteger(process.env.NEWAPI_MAX_TOKENS, 4096);
@@ -122,6 +189,168 @@ function readModelsJsonProviderConfig(providerId: string): ModelsJsonProviderCon
 	}
 }
 
+async function loadCachedValue<T>(options: CachedValueOptions<T>): Promise<CacheLoadResult<T>> {
+	const cached = MODEL_CACHE_ENABLED ? readCacheValue(options) : undefined;
+	if (cached?.state === "fresh") return { value: cached.value, shouldRefresh: false };
+
+	if (cached?.state === "stale") {
+		if (MODEL_CACHE_REFRESH_MODE === "blocking") {
+			const value = await refreshCachedValue(options);
+			if (value !== undefined) return { value, shouldRefresh: false };
+		}
+
+		return {
+			value: cached.value,
+			shouldRefresh: MODEL_CACHE_REFRESH_MODE === "background",
+		};
+	}
+
+	return { value: await refreshCachedValue(options), shouldRefresh: false };
+}
+
+async function refreshCachedValue<T>(options: CachedValueOptions<T>): Promise<T | undefined> {
+	const value = await options.fetchValue();
+	if (value !== undefined && MODEL_CACHE_ENABLED) writeCacheValue(options, value);
+	return value;
+}
+
+function readCacheValue<T>(options: CachedValueOptions<T>): CacheReadResult<T> | undefined {
+	const cachePath = getCachePath(options.namespace, options.key);
+	if (!existsSync(cachePath)) return undefined;
+
+	try {
+		const payload = asRecord(JSON.parse(readFileSync(cachePath, "utf8")) as unknown);
+		if (!payload) return undefined;
+		if (payload.version !== MODEL_CACHE_VERSION) return undefined;
+		if (payload.key !== options.key) return undefined;
+		if (typeof payload.updatedAt !== "number" || !Number.isFinite(payload.updatedAt)) return undefined;
+
+		const value = options.readValue(payload.value);
+		if (value === undefined) return undefined;
+
+		const ageMs = Math.max(0, Date.now() - payload.updatedAt);
+		const maxAgeMs = Math.max(options.ttlMs, MODEL_CACHE_STALE_TTL_MS);
+		if (ageMs > maxAgeMs) return undefined;
+
+		return { value, state: ageMs <= options.ttlMs ? "fresh" : "stale" };
+	} catch (error) {
+		console.warn(
+			`[${PROVIDER_ID}] Failed to read model cache: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return undefined;
+	}
+}
+
+function writeCacheValue<T>(options: CachedValueOptions<T>, value: T): void {
+	try {
+		mkdirSync(MODEL_CACHE_DIR, { recursive: true });
+		const payload: CachePayload<T> = {
+			version: MODEL_CACHE_VERSION,
+			key: options.key,
+			updatedAt: Date.now(),
+			value,
+		};
+		writeFileSync(getCachePath(options.namespace, options.key), JSON.stringify(payload), "utf8");
+	} catch (error) {
+		console.warn(
+			`[${PROVIDER_ID}] Failed to write model cache: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function getCachePath(namespace: string, key: string): string {
+	return join(MODEL_CACHE_DIR, `${namespace}-${hashValue(key).slice(0, 32)}.json`);
+}
+
+function getPublicModelMetadataCacheKey(): string {
+	return stableStringify({ url: MODELS_DEV_URL });
+}
+
+function getNewApiDiscoveryCacheKey(apiKey: string, headers: Record<string, string>): string {
+	return stableStringify({
+		providerId: PROVIDER_ID,
+		baseUrl: getOpenAiBaseUrl(),
+		apiKeyHash: hashValue(apiKey),
+		headersHash: hashValue(stableStringify(headers)),
+	});
+}
+
+function readModelIdsCacheValue(value: unknown): string[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+
+	const ids = value.map((id) => (typeof id === "string" ? id.trim() : "")).filter((id) => id.length > 0);
+	return [...new Set(ids)].sort();
+}
+
+function readPublicModelMetadataCacheValue(value: unknown): PublicModelMetadataCacheValue | undefined {
+	if (!Array.isArray(value)) return undefined;
+
+	const entries: PublicModelMetadataCacheValue = [];
+	for (const entry of value) {
+		const record = asRecord(entry);
+		if (!record) continue;
+
+		const lookupId = readString(record, "lookupId");
+		const metadata = readCachedPublicModelMetadata(record.metadata);
+		if (lookupId && metadata) entries.push({ lookupId: normalizeModelLookupId(lookupId), metadata });
+	}
+
+	return entries;
+}
+
+function readCachedPublicModelMetadata(value: unknown): PublicModelMetadata | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+
+	const metadata: PublicModelMetadata = {};
+	const id = readString(record, "id");
+	const name = readString(record, "name");
+	const input = parsePublicModelInputs(record.input);
+	const contextWindow = readPositiveInteger(record, "contextWindow");
+	const maxTokens = readPositiveInteger(record, "maxTokens");
+
+	if (id) metadata.id = id;
+	if (name) metadata.name = name;
+	if (typeof record.reasoning === "boolean") metadata.reasoning = record.reasoning;
+	if (input) metadata.input = input;
+	if (contextWindow) metadata.contextWindow = contextWindow;
+	if (maxTokens) metadata.maxTokens = maxTokens;
+
+	return metadata;
+}
+
+function hashValue(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function stableStringify(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	if (value && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		return `{${Object.keys(record)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+			.join(",")}}`;
+	}
+
+	return JSON.stringify(value) ?? "undefined";
+}
+
+function parseCacheRefreshMode(value: string | undefined): CacheRefreshMode {
+	const normalized = value?.trim().toLowerCase();
+	if (!normalized) return "background";
+	if (["0", "false", "no", "off", "none"].includes(normalized)) return "off";
+	if (normalized === "blocking") return "blocking";
+	return "background";
+}
+
+function parseDurationSeconds(value: string | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 const OFFICIAL_MODELS_DEV_PATTERNS: Array<{ provider: string; model: RegExp }> = [
 	{ provider: "deepseek", model: /^deepseek/i },
 	{ provider: "openai", model: /^(?:gpt|o\d)/i },
@@ -136,10 +365,60 @@ const OFFICIAL_MODELS_DEV_PATTERNS: Array<{ provider: string; model: RegExp }> =
 ];
 
 export default async function (pi: ExtensionAPI) {
-	const publicModelMetadata = await fetchPublicModelMetadata();
-	const discoveredModels = await discoverModels(publicModelMetadata);
-	const models = discoveredModels.length > 0 ? discoveredModels : modelsFromEnvironment(publicModelMetadata);
+	const providerModels = await loadProviderModels();
 
+	registerNewApiProvider(pi, providerModels.models);
+
+	if (providerModels.shouldRefresh) {
+		void refreshProviderModelsInBackground(pi, providerModels.publicModelMetadata, providerModels.discoveredModelIds);
+	}
+}
+
+async function loadProviderModels(): Promise<ProviderModelLoadResult> {
+	const publicModelMetadata = await loadPublicModelMetadata();
+	const discoveredModelIds = await loadDiscoveredModelIds();
+	const models =
+		discoveredModelIds.ids.length > 0
+			? modelsFromIds(discoveredModelIds.ids, publicModelMetadata.metadata)
+			: modelsFromEnvironment(publicModelMetadata.metadata);
+
+	return {
+		models,
+		publicModelMetadata: publicModelMetadata.metadata,
+		discoveredModelIds: discoveredModelIds.ids,
+		shouldRefresh: publicModelMetadata.shouldRefresh || discoveredModelIds.shouldRefresh,
+	};
+}
+
+async function refreshProviderModelsInBackground(
+	pi: ExtensionAPI,
+	currentPublicModelMetadata: Map<string, PublicModelMetadata>,
+	currentDiscoveredModelIds: string[],
+): Promise<void> {
+	try {
+		const [publicModelMetadataEntries, discoveredModelIds] = await Promise.all([
+			refreshPublicModelMetadataCache(),
+			refreshDiscoveredModelIdsCache(),
+		]);
+
+		if (publicModelMetadataEntries === undefined && discoveredModelIds === undefined) return;
+
+		const publicModelMetadata = publicModelMetadataEntries
+			? toPublicModelMetadataMap(publicModelMetadataEntries)
+			: currentPublicModelMetadata;
+		const modelIds = discoveredModelIds ?? currentDiscoveredModelIds;
+		const models =
+			modelIds.length > 0 ? modelsFromIds(modelIds, publicModelMetadata) : modelsFromEnvironment(publicModelMetadata);
+
+		registerNewApiProvider(pi, models);
+	} catch (error) {
+		console.warn(
+			`[${PROVIDER_ID}] Failed to refresh model cache: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function registerNewApiProvider(pi: ExtensionAPI, models: NewApiModelConfig[]): void {
 	pi.registerProvider(PROVIDER_ID, {
 		name: PROVIDER_NAME,
 		baseUrl: getOpenAiBaseUrl(),
@@ -324,20 +603,57 @@ function getGemini25ThinkingBudget(modelId: string, reasoning: NonNullable<Simpl
 	return budgets[reasoning];
 }
 
-async function discoverModels(publicModelMetadata: Map<string, PublicModelMetadata>): Promise<NewApiModelConfig[]> {
-	if (process.env.NEWAPI_FETCH_MODELS === "false") return [];
+async function loadDiscoveredModelIds(): Promise<DiscoveredModelIdsLoadResult> {
+	if (process.env.NEWAPI_FETCH_MODELS === "false") return { ids: [], shouldRefresh: false };
 
+	const discoverySource = await getNewApiDiscoverySource();
+	if (!discoverySource) return { ids: [], shouldRefresh: false };
+
+	const result = await loadCachedValue({
+		namespace: "models",
+		key: discoverySource.cacheKey,
+		ttlMs: MODELS_CACHE_TTL_MS,
+		readValue: readModelIdsCacheValue,
+		fetchValue: () => fetchNewApiModelIds(discoverySource.headers),
+	});
+
+	return { ids: result.value ?? [], shouldRefresh: result.shouldRefresh };
+}
+
+async function refreshDiscoveredModelIdsCache(): Promise<string[] | undefined> {
+	if (process.env.NEWAPI_FETCH_MODELS === "false") return undefined;
+
+	const discoverySource = await getNewApiDiscoverySource();
+	if (!discoverySource) return undefined;
+
+	return await refreshCachedValue({
+		namespace: "models",
+		key: discoverySource.cacheKey,
+		ttlMs: MODELS_CACHE_TTL_MS,
+		readValue: readModelIdsCacheValue,
+		fetchValue: () => fetchNewApiModelIds(discoverySource.headers),
+	});
+}
+
+async function getNewApiDiscoverySource(): Promise<NewApiDiscoverySource | undefined> {
 	const apiKey = await getNewApiApiKey();
-	if (!apiKey) return [];
+	if (!apiKey) return undefined;
 
+	const headers = await getNewApiDiscoveryHeaders(apiKey);
+
+	return {
+		cacheKey: getNewApiDiscoveryCacheKey(apiKey, headers),
+		headers,
+	};
+}
+
+async function fetchNewApiModelIds(headers: Record<string, string>): Promise<string[] | undefined> {
 	try {
-		const response = await fetch(`${getOpenAiBaseUrl()}/models`, {
-			headers: await getNewApiDiscoveryHeaders(apiKey),
-		});
+		const response = await fetch(`${getOpenAiBaseUrl()}/models`, { headers });
 
 		if (!response.ok) {
 			console.warn(`[${PROVIDER_ID}] Failed to fetch models: ${response.status} ${await response.text()}`);
-			return [];
+			return undefined;
 		}
 
 		const payload = (await response.json()) as NewApiModelsResponse;
@@ -345,10 +661,10 @@ async function discoverModels(publicModelMetadata: Map<string, PublicModelMetada
 			.map((model) => (typeof model.id === "string" ? model.id.trim() : ""))
 			.filter((id) => id.length > 0);
 
-		return [...new Set(ids)].sort().map((id) => toProviderModel(id, publicModelMetadata));
+		return [...new Set(ids)].sort();
 	} catch (error) {
 		console.warn(`[${PROVIDER_ID}] Failed to fetch models: ${error instanceof Error ? error.message : String(error)}`);
-		return [];
+		return undefined;
 	}
 }
 
@@ -459,6 +775,11 @@ function modelsFromEnvironment(publicModelMetadata: Map<string, PublicModelMetad
 		.map((id) => id.trim())
 		.filter((id) => id.length > 0);
 
+	return modelsFromIds(ids, publicModelMetadata);
+}
+
+function modelsFromIds(ids: string[], publicModelMetadata: Map<string, PublicModelMetadata>): NewApiModelConfig[] {
+	ROUTES_BY_MODEL_ID.clear();
 	return [...new Set(ids)].map((id) => toProviderModel(id, publicModelMetadata));
 }
 
@@ -486,20 +807,49 @@ function toProviderModel(id: string, publicModelMetadata: Map<string, PublicMode
 	};
 }
 
-async function fetchPublicModelMetadata(): Promise<Map<string, PublicModelMetadata>> {
-	const metadataById = new Map<string, PublicModelMetadata>();
-	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") return metadataById;
+async function loadPublicModelMetadata(): Promise<PublicModelMetadataLoadResult> {
+	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") {
+		return { metadata: new Map<string, PublicModelMetadata>(), shouldRefresh: false };
+	}
 
+	const result = await loadCachedValue({
+		namespace: "metadata",
+		key: getPublicModelMetadataCacheKey(),
+		ttlMs: MODEL_METADATA_CACHE_TTL_MS,
+		readValue: readPublicModelMetadataCacheValue,
+		fetchValue: fetchPublicModelMetadataEntries,
+	});
+
+	return {
+		metadata: toPublicModelMetadataMap(result.value ?? []),
+		shouldRefresh: result.shouldRefresh,
+	};
+}
+
+async function refreshPublicModelMetadataCache(): Promise<PublicModelMetadataCacheValue | undefined> {
+	if (process.env.NEWAPI_FETCH_MODEL_METADATA === "false") return undefined;
+
+	return await refreshCachedValue({
+		namespace: "metadata",
+		key: getPublicModelMetadataCacheKey(),
+		ttlMs: MODEL_METADATA_CACHE_TTL_MS,
+		readValue: readPublicModelMetadataCacheValue,
+		fetchValue: fetchPublicModelMetadataEntries,
+	});
+}
+
+async function fetchPublicModelMetadataEntries(): Promise<PublicModelMetadataCacheValue | undefined> {
 	try {
 		const response = await fetch(MODELS_DEV_URL);
 		if (!response.ok) {
 			console.warn(`[${PROVIDER_ID}] Failed to fetch public model metadata: ${response.status} ${response.statusText}`);
-			return metadataById;
+			return undefined;
 		}
 
 		const payload = asRecord(await response.json());
-		if (!payload) return metadataById;
+		if (!payload) return [];
 
+		const entries: PublicModelMetadataCacheValue = [];
 		for (const [key, value] of Object.entries(payload)) {
 			if (!isOfficialModelsDevId(key)) continue;
 
@@ -508,15 +858,24 @@ async function fetchPublicModelMetadata(): Promise<Map<string, PublicModelMetada
 
 			const metadata = toPublicModelMetadata(model);
 			for (const lookupId of getPublicModelLookupIds(key, metadata.id ?? key)) {
-				metadataById.set(normalizeModelLookupId(lookupId), metadata);
+				entries.push({ lookupId: normalizeModelLookupId(lookupId), metadata });
 			}
 		}
+
+		return entries;
 	} catch (error) {
 		console.warn(
 			`[${PROVIDER_ID}] Failed to fetch public model metadata: ${error instanceof Error ? error.message : String(error)}`,
 		);
+		return undefined;
 	}
+}
 
+function toPublicModelMetadataMap(entries: PublicModelMetadataCacheValue): Map<string, PublicModelMetadata> {
+	const metadataById = new Map<string, PublicModelMetadata>();
+	for (const entry of entries) {
+		metadataById.set(normalizeModelLookupId(entry.lookupId), entry.metadata);
+	}
 	return metadataById;
 }
 

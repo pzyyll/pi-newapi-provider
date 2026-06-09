@@ -54,6 +54,27 @@ export NEWAPI_MODELS="gpt-4o-mini,qwen3-coder"
 export NEWAPI_FETCH_MODELS=false
 ```
 
+## Model cache
+
+Model discovery cache is enabled by default to keep pi startup fast after the first successful discovery. Cache files are stored under `~/.pi/agent/cache/newapi-provider/`.
+
+- Fresh cache is used without calling the remote endpoint.
+- Stale cache is used immediately, then refreshed in the background.
+- After a successful background refresh, the extension re-registers the provider so the current pi session can see the refreshed model list.
+- If no usable cache exists, the extension fetches models during startup and falls back to `NEWAPI_MODELS` if discovery fails.
+
+Cache TTL values are seconds:
+
+```bash
+export NEWAPI_MODEL_CACHE=true
+export NEWAPI_MODELS_CACHE_TTL=1800          # /v1/models, 30 minutes
+export NEWAPI_MODEL_METADATA_CACHE_TTL=86400 # models.dev metadata, 24 hours
+export NEWAPI_MODEL_CACHE_STALE_TTL=604800   # stale cache usable up to 7 days
+export NEWAPI_MODEL_CACHE_REFRESH=background # background, blocking, or off
+```
+
+Set `NEWAPI_MODEL_CACHE=false` to disable all local model cache reads and writes.
+
 ## Useful settings
 
 - `NEWAPI_PROVIDER_ID` — provider id used in `/model` and `auth.json`. Defaults to `newapi`.
@@ -66,5 +87,10 @@ export NEWAPI_FETCH_MODELS=false
 - `NEWAPI_HEADERS` — JSON object of additional headers. Overridden by matching `models.json` provider `headers`.
 - `NEWAPI_SESSION_ID_HEADER` — header name used for the pi session id. Defaults to `x-session-id`.
 - `NEWAPI_DEBUG_SESSION_HEADERS` — set to `1` to log whether the session header was injected.
+- `NEWAPI_MODEL_CACHE` — set to `false` to disable local cache for `/v1/models` and `models.dev` metadata.
+- `NEWAPI_MODELS_CACHE_TTL` — fresh-cache TTL for NewAPI `/v1/models`, in seconds. Defaults to `1800`.
+- `NEWAPI_MODEL_METADATA_CACHE_TTL` — fresh-cache TTL for `models.dev` metadata, in seconds. Defaults to `86400`.
+- `NEWAPI_MODEL_CACHE_STALE_TTL` — maximum stale cache age, in seconds. Defaults to `604800`.
+- `NEWAPI_MODEL_CACHE_REFRESH` — stale-cache refresh behavior: `background` (default), `blocking`, or `off`.
 
 For per-model metadata, edit `toProviderModel()` in `index.ts`.
