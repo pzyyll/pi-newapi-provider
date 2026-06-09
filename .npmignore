@@ -1,0 +1,32 @@
+# Local/project-only files
+AGENTS.md
+context.md
+.pi/
+
+# Development tooling
+eslint.config.js
+tsconfig.json
+.prettierrc.json
+.prettierignore
+bun.lock
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Caches and build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.eslintcache
+
+# OS/log noise
+.DS_Store
+Thumbs.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

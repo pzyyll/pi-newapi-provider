@@ -1,7 +1,11 @@
 {
 	"name": "pi-newapi-provider",
 	"version": "0.1.0",
-	"private": true,
+	"author": {
+		"name": "pzyyll",
+		"email": "pzyyll@gmail.com"
+	},
+	"description": "Pi custom provider for NewAPI gateways.",
 	"type": "module",
 	"keywords": [
 		"pi-package",
@@ -9,9 +13,12 @@
 		"newapi",
 		"provider"
 	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/pzyyll/pi-newapi-provider.git"
+	},
+	"homepage": "https://github.com/pzyyll/pi-newapi-provider#readme",
 	"scripts": {
-		"clean": "echo 'nothing to clean'",
-		"build": "echo 'nothing to build'",
 		"lint": "eslint .",
 		"typecheck": "tsc --noEmit",
 		"format": "prettier --write .",
@@ -21,7 +28,8 @@
 	"pi": {
 		"extensions": [
 			"./index.ts"
-		]
+		],
+		"image": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/new-api.png"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
